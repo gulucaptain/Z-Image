@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 <h1 align="center">⚡️- Image<br><sub><sup>An Efficient Image Generation Foundation Model with Single-Stream Diffusion Transformer</sup></sub></h1>
 
 <div align="center">
@@ -455,3 +456,7 @@ If you find our work useful in your research, please consider citing:
 ## 🤝 We're Hiring!
 
 We're actively looking for **Research Scientists**, **Engineers**, and **Interns** to work on foundational generative models and their applications. Interested candidates please send your resume to: **jingpeng.gp@alibaba-inc.com**
+=======
+# Z-Image
+Self-repo for Z-Image deployment.
+>>>>>>> github/main
