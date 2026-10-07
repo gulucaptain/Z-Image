@@ -24,6 +24,159 @@ Welcome to the official repository for the Z-Image（造相）project!
 
 ## ✨ Z-Image
 
+### Gradio 工作台：远程启动，本地访问
+
+1. **在远程服务器的终端中**进入本项目目录并启动服务：
+
+   ```bash
+   cd /path/to/Z-Image
+   bash gradio_inference.sh --host 127.0.0.1 --port 7860
+   # 或使用已经安装依赖的 Python 环境
+   python app.py --host 127.0.0.1 --port 7860
+   ```
+
+   将 `/path/to/Z-Image` 替换为服务器上的实际项目路径，两个启动命令任选一个。
+   启动脚本优先使用当前虚拟环境，其次使用项目 `.venv`。
+   新环境需先在服务器上安装依赖：`pip install -e '.[ui,video]'`；音频提取另需系统安装 FFmpeg。
+   等待服务启动完成，并保持服务进程运行。
+
+2. **在本地电脑的终端中**建立 SSH 端口转发（不要在远程服务器终端中执行）：
+
+   ```bash
+   ssh -N -L 7860:127.0.0.1:7860 用户名@服务器地址
+   ```
+
+   将用户名和服务器地址替换为实际值。如果 SSH 使用非默认端口，添加 `-p SSH端口`。
+   保持此 SSH 连接开启；`-N` 表示仅转发端口，不进入远程命令行。
+
+3. **在本地电脑的浏览器中**打开 `http://127.0.0.1:7860`。
+
+服务器上的 `127.0.0.1` 指服务器自身，本地浏览器中的 `127.0.0.1` 指本地电脑；
+SSH 转发将两者连接起来。此方式只需能通过 SSH 连接服务器，无需开放服务器的公网 7860 端口。
+如果本地 7860 端口已被占用，改用
+`ssh -N -L 17860:127.0.0.1:7860 用户名@服务器地址`，然后在本地访问 `http://127.0.0.1:17860`。
+
+如果使用 VS Code Remote SSH，也可以在“端口（Ports）”面板中转发远程端口 `7860`，
+然后打开该面板显示的本地地址；此时无需另外执行上述 SSH 转发命令。
+如果服务本身就在本地电脑运行，启动后直接访问 `http://127.0.0.1:7860` 即可，无需 SSH 转发。
+
+工作台提供文生图、逐步图像保存、批量生成、Qwen-VL 参考图反推重绘、视频帧/音频提取、历史与已有结果浏览。
+“逐步预览并保存到 outputs2”默认开启：文生图每完成一个采样 step，就更新预览和步骤画廊，完成后显示最终图像。
+逐步解码会增加生成耗时；关闭该选项后仅显示最终图像。批量生成和参考图重绘的步骤图可在下载列表或“结果与历史”的“逐步图像”目录中查看。
+
+文生图页面的“分析 Flow Matching 速度场”默认开启，可独立于逐步图片保存使用。
+生成过程中，“Flow Matching 速度场分析”面板逐步更新以下内容：
+
+- **空间热力图**：每个 latent 位置的通道速度 RMS；色标上限固定为首个有效步骤的最大值。
+  超出上限的值显示为最高颜色，饱和比例标在图下；非有限值显示为洋红色。它不是图像平面的二维运动场。
+- **强度曲线**：实际送给调度器的速度 RMS 和更新 RMS；启用 CFG 时另显示条件、无条件预测 RMS。
+- **方向曲线**：相邻有效步骤的速度展平后的余弦相似度；首步、零范数或非有限速度记为缺失值。
+- **逐步数值与历史**：速度均值、标准差、绝对值分位数、时间、sigma、步长、更新比例和各步热力图。
+  跳过模型计算的步骤标为 `skipped`，不会重复统计速度。
+
+速度采用调度器的 `dz/dsigma` 约定（模型原始输出经过符号转换和 CFG 后），sigma 随生成递减：
+`z_next = z + (sigma_next - sigma) * velocity`。
+`update_rms = abs(sigma_next - sigma) * velocity_rms`；
+`relative_update = update_rms / latent_rms`，分母使用更新前的 latent。
+表中 `model_time` 为模型接收的 `1 - timestep / 1000`，与 sigma 分别记录。
+
+分析文件保存在 `outputs/single/<任务编号>/velocity/`，并加入当前任务的下载列表：
+`velocity.csv`、`velocity.json`、各步热力图 PNG 和原始 RMS 数值 NPY。
+JSON 包含色标和速度约定，`metadata.json` 记录分析文件及统计结果。
+这里只保存统计和空间 RMS，不保存完整的速度张量；这些指标反映当前采样轨迹的行为，不能直接衡量速度预测准确性。
+统计、CPU 数据传输和文件写入会增加耗时，关闭分析选项可避免这些开销；批量生成和参考图重绘暂不提供此分析面板。
+
+宽高必须是 16 的倍数。共用参数适用于三个图像生成页面；批量任务的 seed 按记录顺序递增。
+模型在首次生成时加载，后续复用；模型设置、卸载和图像生成共享串行队列。
+反推重绘会先卸载 Z-Image，完成 Qwen-VL 描述后再加载 Z-Image。
+反推使用文字描述进行重绘，不使用参考图像 latent 作为去噪输入。
+
+```text
+app.py                         # 统一 Gradio 入口
+gradio_inference.sh             # 启动脚本
+src/zimage_app/
+  settings.py                  # 路径和环境配置
+  service.py                   # 模型管理、图像生成、输出参数与历史
+  inputs.py                    # TXT / JSON 提示词解析和筛选
+  workflows.py                 # 批量生成、反推重绘、视频工具适配
+  ui.py                        # Gradio 页面与事件
+  cli.py                       # 共用命令行生成入口
+src/zimage/                    # 原有模型与采样流程
+scripts/generate.py            # 新命令行入口
+scripts/legacy/                # 归档的独立推理、数据工具和启动脚本
+tests/test_app.py              # 无需加载模型的功能测试
+outputs/<类型>/<任务编号>/      # final.png 和 metadata.json
+outputs2/<任务编号>/            # step_001.png、step_002.png 等
+```
+
+每次生成使用独立目录，`metadata.json` 记录提示词、seed、模型配置、耗时和任务状态。
+开启逐步保存后，生成完成时会按 step 顺序自动合成 `outputs2/<任务编号>/steps.mp4`，
+每步播放 0.5 秒，每帧左上角标注 `Step 当前步 / 总步数`。Gradio 的“文生图 / 逐步保存”页面提供视频播放器和下载入口；
+`scripts/image_generation_step_inference.py` 也会生成该视频并打印路径。
+视频编码使用系统 `ffmpeg`（H.264）；合成失败时保留最终图和全部 step 图像，并在状态中显示原因。
+“同一提示词重复生成”页面支持同一 prompt 运行 n 次（默认 100 次），使用顶部共用参数。
+Seed 支持从顶部 Seed 顺序递增或逐次随机生成不同的值。
+每次任务保存到 `outputs2/repeat_<任务编号>/`，每个 case 位于 `cases/case_0001/` 等独立目录，
+包含 `final.png`、`metadata.json`，开启逐步保存时还包含 `steps/`。
+`manifest.json` 记录完整 seed 清单和运行顺序；`cases.mp4` 按运行顺序播放最终图像并标注 Case 编号。
+页面可播放视频并下载全部结果的 ZIP（保存在任务目录旁）；中途失败时也会打包已有结果。
+命令行入口：
+
+```bash
+python scripts/repeat_generation.py --prompt "Mona Lisa" --count 100 --seed-mode increment --seed 42
+python scripts/repeat_generation.py --prompt "Mona Lisa" --count 100 --seed-mode random --fps 2
+# 需要保存每个 case 的中间步骤时添加 --save-steps
+```
+
+“双噪声实验”页面支持三个结构：噪声 A 使用顶部 Seed，噪声 B 使用独立 Seed B，
+α 是 B 的权重。两条分支共用提示词、CFG 和 sigma 时间表，速度采用原采样器的 `dz/dsigma` 约定。
+完整操作、公式、参数及实验比较方法见 [双噪声实验说明](readme_dual_noise.md)。
+
+- `initial`：先令 `z0=(1-α)εA+αεB`，再普通推理。默认除以 `sqrt((1-α)^2+α^2)`
+  补偿独立高斯噪声混合后的方差；可关闭。同 seed 时不补偿。
+- `latent`：A/B 独立完成前 k 个 Euler 更新，随后混合 latent，余下步骤只推理混合后的轨迹。
+  中间 latent 不做方差补偿。该步的轨迹记录包含 `merge_jump_rms`；有效速度统计包含混合跳变除以 `delta_sigma`。
+- `velocity`：每步先在 A/B 位置分别计算经过 CFG 的速度，再令 `v=(1-α)vA+αvB`，
+  用 `z←z+delta_sigma*v` 更新输出，输出初始值为未经方差补偿的线性混合。
+  默认 `coupled` 让 A/B 也用组合速度更新；`independent` 让 A/B 各自推进。
+  在当前 Euler 更新和固定 α 下，独立规则的输出恒等于 A/B latent 的线性混合（浮点误差除外）；
+  耦合规则会改变分支轨迹，但并不保证改善生成质量。
+
+结果保存在 `outputs/dual_noise/<任务编号>/`，中间图像和标注 step 的视频仍保存在 `outputs2/<任务编号>/`。
+页面可预览和下载图像、视频及 `metadata.json`；后者记录两个 seed、混合参数、逐步跳变、分支距离及模型调用次数。
+CLI 支持相同功能：
+
+```bash
+python scripts/dual_noise_inference.py --prompt "Mona Lisa" --mode initial --seed-a 42 --seed-b 43 --weight-b 0.5 --save-steps
+python scripts/dual_noise_inference.py --prompt "Mona Lisa" --mode latent --mix-step 4 --save-steps
+python scripts/dual_noise_inference.py --prompt "Mona Lisa" --mode velocity --velocity-rule coupled --save-steps
+# velocity 可改为 independent；initial 可添加 --raw-initial-mix；可添加 --analyze-velocity 导出有效更新统计
+```
+
+历史文生图、参考图、Qwen 重绘和 OmniBench 结果归档在 `tmp/history/`；
+视频输入与 OmniBench 提示词位于 `tmp/inputs/`，视频帧和音频位于 `tmp/media/`。
+可在“结果与历史”中选择目录浏览、下载；新任务继续写入 `outputs/`，逐步图像写入 `outputs2/`。
+模型权重 `ckpts/` 和 README 使用的展示素材 `assets/` 保留原位。
+
+批量页面支持每行一个提示词的 TXT、JSON 字符串数组，以及已有的
+`scenarios[].reference_image`、`samples[].image_prompt` 和 `prompts` 格式。
+可使用内置 `tmp/inputs/scene_preview_image_prompts_800.json`，按数据集、ID、条数筛选并先预览任务。
+旧 OmniBench 脚本中的重试、断点跳过与推荐画幅选项仍可通过归档脚本使用：
+
+```bash
+python scripts/legacy/minimax_bench_image_generation.py --datasets VDR --dry-run --limit 5
+python scripts/generate.py --prompt "Mona Lisa" --steps 8 --save-steps
+# 保留的两个兼容入口也调用同一推理服务
+python scripts/image_generation_inference.py --prompt "Mona Lisa"
+python scripts/image_generation_step_inference.py --steps 8
+python -m unittest discover -s tests -v
+```
+
+可设置 `ZIMAGE_MODEL_PATH`、`ZIMAGE_QWEN_PATH`、`ZIMAGE_ATTENTION`、`ZIMAGE_COMPILE`、
+`ZIMAGE_OUTPUT_DIR`、`ZIMAGE_TMP_DIR`。默认使用已有本地 Z-Image-Turbo / Qwen3-VL 模型路径，
+Attention 默认 `native`；可在“模型设置”页面选择后端、启用编译或卸载模型。
+远程服务器运行、本地电脑访问的连接方式见上面的 SSH 端口转发步骤。
+
 Z-Image is a powerful and highly efficient image generation model family with **6B** parameters. Currently there are four variants:
 
 - 🚀 **Z-Image-Turbo** – A distilled version of Z-Image that matches or exceeds leading competitors with only **8 NFEs** (Number of Function Evaluations). It offers **⚡️sub-second inference latency⚡️** on enterprise-grade H800 GPUs and fits comfortably within **16G VRAM consumer devices**. It excels in photorealistic image generation, bilingual text rendering (English & Chinese), and robust instruction adherence.
@@ -118,7 +271,7 @@ pip install -e .
 ```
 Then run the following code to generate an image:
 ```bash
-python inference.py
+python scripts/generate.py
 ```
 
 #### (2) Diffusers Inference

@@ -19,6 +19,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+ui = ["gradio>=6.0,<7"]
+video = ["opencv-python>=4.8"]
 dev = [
     "black",
     "isort",

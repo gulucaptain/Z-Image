@@ -1,7 +1,7 @@
 """Z-Image Pipeline."""
 
 import inspect
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 
 from loguru import logger
 import torch
@@ -82,7 +82,13 @@ def generate(
     cfg_truncation: float = DEFAULT_CFG_TRUNCATION,
     max_sequence_length: int = DEFAULT_MAX_SEQUENCE_LENGTH,
     output_type: str = "pil",
+    callback_on_step_end: Optional[Callable[[int, torch.Tensor, torch.Tensor], None]] = None,
+    callback_on_velocity: Optional[Callable[[dict], None]] = None,
+    dual_noise=None,
+    callback_on_dual_step: Optional[Callable[[dict], None]] = None,
 ):
+    if dual_noise is not None:
+        dual_noise.validate(num_inference_steps)
     device = next(transformer.parameters()).device
 
     if hasattr(vae, "config") and hasattr(vae.config, "block_out_channels"):
@@ -188,6 +194,15 @@ def generate(
 
     latents = torch.randn(shape, generator=generator, device=device, dtype=torch.float32)
 
+    dual_state = None
+    if dual_noise is not None:
+        from .dual_noise import DualNoiseState
+        generator_b = torch.Generator(device).manual_seed(dual_noise.seed_b)
+        noise_b = torch.randn(shape, generator=generator_b, device=device, dtype=torch.float32)
+        dual_state = DualNoiseState(dual_noise, latents, noise_b,
+                                    same_seed=generator is not None and generator.initial_seed() == dual_noise.seed_b)
+        latents = dual_state.initial
+
     actual_batch_size = batch_size * num_images_per_prompt
     image_seq_len = (latents.shape[2] // 2) * (latents.shape[3] // 2)
 
@@ -212,14 +227,8 @@ def generate(
 
     from tqdm import tqdm
 
-    # Denoising loop with progress bar
-    for i, t in enumerate(tqdm(timesteps, desc="Denoising", total=len(timesteps))):
-        # If current t is 0 and it's the last step, skip computation
-        if t == 0 and i == len(timesteps) - 1:
-            logger.debug(f"Step {i+1}/{num_inference_steps} | t: {t.item():.2f} | Skipping last step")
-            continue
-
-        timestep = t.expand(latents.shape[0])
+    def predict_velocity(state, t):
+        timestep = t.expand(state.shape[0])
         timestep = (1000 - timestep) / 1000
         t_norm = timestep[0].item()
 
@@ -231,14 +240,14 @@ def generate(
         apply_cfg = do_classifier_free_guidance and current_guidance_scale > 0
 
         if apply_cfg:
-            latents_typed = latents.to(
+            latents_typed = state.to(
                 transformer.dtype if hasattr(transformer, "dtype") else next(transformer.parameters()).dtype
             )
             latent_model_input = latents_typed.repeat(2, 1, 1, 1)
             prompt_embeds_model_input = prompt_embeds_list + negative_prompt_embeds_list
             timestep_model_input = timestep.repeat(2)
         else:
-            latent_model_input = latents.to(next(transformer.parameters()).dtype)
+            latent_model_input = state.to(next(transformer.parameters()).dtype)
             prompt_embeds_model_input = prompt_embeds_list
             timestep_model_input = timestep
 
@@ -272,8 +281,47 @@ def generate(
             noise_pred = torch.stack([t.float() for t in model_out_list], dim=0)
 
         noise_pred = -noise_pred.squeeze(2)
+        return {"velocity": noise_pred,
+                "conditional_velocity": -torch.stack(pos_out).float().squeeze(2) if apply_cfg else None,
+                "unconditional_velocity": -torch.stack(neg_out).float().squeeze(2) if apply_cfg else None,
+                "guidance_scale": current_guidance_scale if apply_cfg else 0.0,
+                "model_time": t_norm}
+
+    # Denoising loop with progress bar
+    for i, t in enumerate(tqdm(timesteps, desc="Denoising", total=len(timesteps))):
+        # If current t is 0 and it's the last step, skip computation
+        if t == 0 and i == len(timesteps) - 1:
+            logger.debug(f"Step {i+1}/{num_inference_steps} | t: {t.item():.2f} | Skipping last step")
+            if callback_on_velocity is not None:
+                callback_on_velocity({"step": i + 1, "timestep": float(t.item()), "skipped": True})
+            if callback_on_step_end is not None:
+                callback_on_step_end(i, t, latents)
+            continue
+
+        if dual_state is None:
+            prediction = predict_velocity(latents, t)
+        else:
+            dt = scheduler.sigmas[i + 1] - scheduler.sigmas[i]
+            prediction, trace = dual_state.velocity(latents, lambda state: predict_velocity(state, t), dt, i + 1)
+            if callback_on_dual_step is not None:
+                callback_on_dual_step(trace)
+        noise_pred = prediction["velocity"]
+        latents_before = latents
         latents = scheduler.step(noise_pred.to(torch.float32), t, latents, return_dict=False)[0]
+        if callback_on_velocity is not None:
+            sigma_idx = scheduler._step_index - 1
+            callback_on_velocity({
+                "step": i + 1, "timestep": float(t.item()), "model_time": prediction["model_time"],
+                "sigma": float(scheduler.sigmas[sigma_idx].item()),
+                "sigma_next": float(scheduler.sigmas[sigma_idx + 1].item()),
+                "latents": latents_before, "velocity": noise_pred,
+                "conditional_velocity": prediction["conditional_velocity"],
+                "unconditional_velocity": prediction["unconditional_velocity"],
+                "guidance_scale": prediction["guidance_scale"], "skipped": False,
+            })
         assert latents.dtype == torch.float32
+        if callback_on_step_end is not None:
+            callback_on_step_end(i, t, latents)
 
     if output_type == "latent":
         return latents

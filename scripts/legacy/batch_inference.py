@@ -1,13 +1,17 @@
 """Batch prompt inference for Z-Image."""
 
+# Standalone archived scripts use the current checkout's source modules.
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parents[2] / "src"))
+
 import os
 from pathlib import Path
 import time
 
 import torch
 
-from inference import ensure_weights
-from utils import AttentionBackend, load_from_local_dir, set_attention_backend
+from utils import AttentionBackend, ensure_model_weights, load_from_local_dir, set_attention_backend
 from zimage import generate
 
 
@@ -24,7 +28,7 @@ def read_prompts(path: str) -> list[str]:
     return prompts
 
 
-PROMPTS = read_prompts(os.environ.get("PROMPTS_FILE", "prompts/prompt1.txt"))
+
 
 
 def slugify(text: str, max_len: int = 60) -> str:
@@ -56,7 +60,8 @@ def select_device() -> str:
 
 
 def main():
-    model_path = ensure_weights("ckpts/Z-Image-Turbo")
+    PROMPTS = read_prompts(os.environ.get("PROMPTS_FILE", "prompts/prompt1.txt"))
+    model_path = ensure_model_weights(os.environ.get("ZIMAGE_MODEL_PATH", "/data/haoyuzhao/models/Z-Image-Turbo"), verify=False)
     dtype = torch.bfloat16
     compile = False
     height = 1024

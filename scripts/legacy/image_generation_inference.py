@@ -1,5 +1,8 @@
-"""Z-Image PyTorch Native Inference."""
 
+# Standalone archived scripts use the current checkout's source modules.
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parents[2] / "src"))
 import os
 import time
 import warnings
@@ -12,21 +15,18 @@ from zimage import generate
 
 
 def main():
-    model_path = ensure_model_weights("ckpts/Z-Image-Turbo", verify=False)  # True to verify with md5
+    model_path = ensure_model_weights("/data/haoyuzhao/models/Z-Image-Turbo", verify=False)  # True to verify with md5
     dtype = torch.bfloat16
     compile = False  # default False for compatibility
-    output_path = "example.png"
-    height = 1024
-    width = 1024
-    num_inference_steps = 8
+    output_path = "example7.png"
+    height = 720
+    width = 1280
+    num_inference_steps = 1
     guidance_scale = 0.0
     seed = 42
     attn_backend = os.environ.get("ZIMAGE_ATTENTION", "_native_flash")
     prompt = (
-        "Young Chinese woman in red Hanfu, intricate embroidery. Impeccable makeup, red floral forehead pattern. "
-        "Elaborate high bun, golden phoenix headdress, red flowers, beads. Holds round folding fan with lady, trees, bird. "
-        "Neon lightning-bolt lamp (⚡️), bright yellow glow, above extended left palm. Soft-lit outdoor night background, "
-        "silhouetted tiered pagoda (西安大雁塔), blurred colorful distant lights."
+        "Mona Lisa"
     )
 
     # Device selection priority: cuda -> tpu -> mps -> cpu
