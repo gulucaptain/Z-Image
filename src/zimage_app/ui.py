@@ -75,18 +75,28 @@ def build_app(settings=None, service=None):
         except Exception as exc:
             raise gr.Error(str(exc)) from exc
 
-    def dual(prompt, negative, mode, seed_b, weight_b, mix_step, normalize, velocity_rule,
+    def dual(prompt, negative, seed_b, stage1_steps, split, epsilon, analyze,
              height, width, steps, guidance, seed, save_steps, progress=gr.Progress()):
         try:
-            request = request_from(prompt, height, width, steps, guidance, seed, save_steps, negative)
-            config = DualNoiseConfig(mode, int(seed_b), float(weight_b), int(mix_step), bool(normalize), velocity_rule)
+            from dataclasses import replace
+            request = replace(request_from(prompt, height, width, steps, guidance, seed, save_steps, negative),
+                              analyze_velocity=bool(analyze))
+            config = DualNoiseConfig(seed_b=int(seed_b), stage1_steps=int(stage1_steps),
+                                     stage_split=float(split), terminal_epsilon=float(epsilon))
             config.validate(request.steps)
             request.validate()
-            yield None, [], None, [], "加载模型 / 准备双噪声生成"
+            yield None, None, [], None, [], "加载模型 / 准备分阶段实验", []
             for result in service.generate_stream(request, progress, dual_noise=config):
-                files = [result["image"], result["metadata"], *result["steps"], result.get("step_video")]
-                yield (result["image"], [(p, f"Step {i + 1}") for i, p in enumerate(result["steps"])],
-                       result.get("step_video"), [p for p in files if p], result["status"])
+                files = [result["image"], result.get("stage1_image"), result.get("joint_final_image"),
+                         result["metadata"], *result["steps"], result.get("step_video")]
+                if result.get("diagnostics"):
+                    files.extend(result["diagnostics"]["files"])
+                fields = ["step", "stage", "active", "joint_time_next", "xy_distance_rms",
+                          "inactive_update_rms", "model_evaluations"]
+                rows = [[item.get(field) for field in fields] for item in result.get("dual_noise_trace", [])]
+                yield (result["image"], result.get("stage1_image"),
+                       [(p, f"Step {i + 1} · X 左 / Y 右") for i, p in enumerate(result["steps"])],
+                       result.get("step_video"), list(dict.fromkeys(p for p in files if p)), result["status"], rows)
         except Exception as exc:
             raise gr.Error(str(exc)) from exc
 
@@ -188,45 +198,46 @@ def build_app(settings=None, service=None):
                                concurrency_id="models", concurrency_limit=1, show_progress="minimal")
 
         with gr.Tab("双噪声实验"):
-            gr.Markdown("噪声 A 使用顶部 Seed，噪声 B 使用下方 Seed B；两条分支使用相同提示词与采样时间表。"
-                        "混合权重 α 表示 B 的占比：α=0 取 A，α=1 取 B。")
+            gr.Markdown("### 双噪声分阶段 Flow Matching · 生成后复制基准\n"
+                        "按照方案运行 (X₀,Y₀) → (Q̂,Y₀) → (Q̂,Q̂)：先只更新 X，再只更新 Y。"
+                        "X₀ 使用顶部 Seed，Y₀ 使用下方 Seed Y。现有模型用于阶段一，阶段二使用解析复制速度；"
+                        "这里没有训练新的联合速度模型。")
             with gr.Row():
                 with gr.Column(scale=2):
-                    dual_prompt = gr.Textbox(label="双噪声提示词", value="Mona Lisa", lines=4)
-                    dual_negative = gr.Textbox(label="负向提示词", lines=2)
-                    dual_mode = gr.Radio(
-                        choices=[("1 · 初始噪声混合", "initial"), ("2 · 中途 latent 混合", "latent"),
-                                 ("3 · 双轨迹速度组合", "velocity")], value="initial", label="实验结构",
-                    )
+                    dual_prompt = gr.Textbox(label="阶段一生成提示词", value="Mona Lisa", lines=4)
+                    dual_negative = gr.Textbox(label="阶段一负向提示词", lines=2)
                     with gr.Row():
-                        seed_b = gr.Number(value=43, precision=0, label="Seed B")
-                        weight_b = gr.Slider(0, 1, value=0.5, step=0.01, label="B 的混合权重 α")
-                    mix_step = gr.Slider(1, 50, value=4, step=1, label="完成第 k 步后混合 latent（仅模式 2）")
-                    normalize = gr.Checkbox(value=True, label="初始噪声混合后补偿方差（仅模式 1）")
-                    velocity_rule = gr.Radio(
-                        choices=[("混合速度同时更新 A/B（耦合）", "coupled"),
-                                 ("A/B 各自推进，输出累计混合速度", "independent")],
-                        value="coupled", label="速度更新规则（仅模式 3）",
-                    )
-                    with gr.Accordion("三种结构的具体规则", open=False):
-                        gr.Markdown(
-                            "**1**：先混合初始噪声，再普通推理。方差补偿将混合除以 √((1−α)²+α²)；同 seed 时不补偿。\n\n"
-                            "**2**：A/B 各自完成前 k 步，混合 latent 后继续单条普通轨迹；混合时不做方差补偿。\n\n"
-                            "**3**：每步在 A/B 位置各计算速度，输出用加权速度更新。耦合规则让 A/B 也使用该速度更新；"
-                            "独立规则让 A/B 各用自身速度推进。输出初始值为未补偿的线性混合。"
-                            "独立规则在 Euler 更新下等价于逐步混合 A/B latent，不能视为额外的非线性生成能力。"
-                        )
-                    dual_btn = gr.Button("运行双噪声实验", variant="primary")
+                        seed_b = gr.Number(value=43, precision=0, label="Seed Y（第二个独立噪声）")
+                        stage1_steps = gr.Number(value=4, minimum=1, precision=0, label="阶段一模型采样步数 N₁")
+                    gr.Markdown("顶部采样步数是总步数 N；阶段二步数 N₂=N−N₁，两个阶段都至少分配 1 步。"
+                                "例如总步数 12、N₁=8 表示 8 步模型生成 + 4 步解析复制。")
+                    with gr.Row():
+                        split = gr.Slider(0.05, 0.95, value=0.5, step=0.05, label="时间分界 r")
+                        epsilon = gr.Number(value=0, minimum=0, label="终点 epsilon（0 ≤ epsilon < 1−r）")
+                    analyze = gr.Checkbox(value=False, label="保存逐阶段有效速度统计与热力图")
+                    gr.Markdown("默认 epsilon=0，最终 Y=X，改变 Seed Y 不应改变最终图像；"
+                                "epsilon>0 时在 t=1−epsilon 提前停止，保留复制残差。开启顶部逐步保存可播放左右并排的 X/Y 过程。")
+                    with gr.Accordion("互补任务 (C,Q) 的训练方案", open=False):
+                        gr.Markdown("文档建议的改进是 (X₀,Y₀) → (C,Y₀) → (C,Q)：第一阶段生成低频、布局或结构 C，"
+                                    "第二阶段读取 C 并生成剩余细节。它需要条件速度模型、配对数据 C=A(Q) 和相应训练权重。"
+                                    "当前文生图权重没有该条件接口，因此本入口只运行原始复制基准。"
+                                    "该基准验证阶段冻结、时间映射和第二噪声的退化，不验证结构条件生成的质量收益。")
+                    dual_btn = gr.Button("运行分阶段复制基准", variant="primary")
                 with gr.Column(scale=1, min_width=280):
-                    dual_image = gr.Image(label="双噪声结果 / 实时预览", type="filepath", height=320)
-                    dual_status = gr.Textbox(label="双噪声状态", lines=4, interactive=False)
+                    dual_image = gr.Image(label="联合实时预览 / 最终 Y", type="filepath", height=280)
+                    stage1_image = gr.Image(label="阶段一完成的 X（阶段二固定）", type="filepath", height=280)
+                    dual_status = gr.Textbox(label="分阶段实验状态", lines=4, interactive=False)
             with gr.Row():
-                dual_gallery = gr.Gallery(label="双噪声每步结果", columns=3, height=320, scale=2, min_width=360, object_fit="contain")
-                dual_video = gr.Video(label="双噪声过程视频", height=320, scale=1, min_width=280, interactive=False)
-            dual_files = gr.File(label="下载实验图像、视频与参数轨迹记录", file_count="multiple")
+                dual_gallery = gr.Gallery(label="每步联合状态：X 左 / Y 右", columns=2, height=320, scale=2, min_width=360, object_fit="contain")
+                dual_video = gr.Video(label="分阶段 X/Y 过程视频", height=320, scale=1, min_width=280, interactive=False)
+            trace_table = gr.Dataframe(
+                headers=["Step", "阶段", "活动分量", "联合时间 t", "X/Y 距离 RMS", "冻结分量更新 RMS", "累计模型调用"],
+                interactive=False, label="阶段与冻结检查", wrap=True,
+            )
+            dual_files = gr.File(label="下载 X/Y 图像、视频与阶段参数记录", file_count="multiple")
             dual_btn.click(
-                dual, [dual_prompt, dual_negative, dual_mode, seed_b, weight_b, mix_step, normalize, velocity_rule, *parameters],
-                [dual_image, dual_gallery, dual_video, dual_files, dual_status],
+                dual, [dual_prompt, dual_negative, seed_b, stage1_steps, split, epsilon, analyze, *parameters],
+                [dual_image, stage1_image, dual_gallery, dual_video, dual_files, dual_status, trace_table],
                 concurrency_id="models", concurrency_limit=1, show_progress="minimal",
             )
 

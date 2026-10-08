@@ -129,29 +129,16 @@ python scripts/repeat_generation.py --prompt "Mona Lisa" --count 100 --seed-mode
 # 需要保存每个 case 的中间步骤时添加 --save-steps
 ```
 
-“双噪声实验”页面支持三个结构：噪声 A 使用顶部 Seed，噪声 B 使用独立 Seed B，
-α 是 B 的权重。两条分支共用提示词、CFG 和 sigma 时间表，速度采用原采样器的 `dz/dsigma` 约定。
-完整操作、公式、参数及实验比较方法见 [双噪声实验说明](readme_dual_noise.md)。
-
-- `initial`：先令 `z0=(1-α)εA+αεB`，再普通推理。默认除以 `sqrt((1-α)^2+α^2)`
-  补偿独立高斯噪声混合后的方差；可关闭。同 seed 时不补偿。
-- `latent`：A/B 独立完成前 k 个 Euler 更新，随后混合 latent，余下步骤只推理混合后的轨迹。
-  中间 latent 不做方差补偿。该步的轨迹记录包含 `merge_jump_rms`；有效速度统计包含混合跳变除以 `delta_sigma`。
-- `velocity`：每步先在 A/B 位置分别计算经过 CFG 的速度，再令 `v=(1-α)vA+αvB`，
-  用 `z←z+delta_sigma*v` 更新输出，输出初始值为未经方差补偿的线性混合。
-  默认 `coupled` 让 A/B 也用组合速度更新；`independent` 让 A/B 各自推进。
-  在当前 Euler 更新和固定 α 下，独立规则的输出恒等于 A/B latent 的线性混合（浮点误差除外）；
-  耦合规则会改变分支轨迹，但并不保证改善生成质量。
-
-结果保存在 `outputs/dual_noise/<任务编号>/`，中间图像和标注 step 的视频仍保存在 `outputs2/<任务编号>/`。
-页面可预览和下载图像、视频及 `metadata.json`；后者记录两个 seed、混合参数、逐步跳变、分支距离及模型调用次数。
-CLI 支持相同功能：
+“双噪声实验”现按 [分阶段方案](双噪声分阶段Flow_Matching方案.md) 运行生成后复制基准：
+`(X₀,Y₀) → (Q̂,Y₀) → (Q̂,Q̂)`。第一阶段只更新 X、冻结 Y，第二阶段固定 X、使用解析速度更新 Y。
+顶部步数为总预算 N，阶段二不调用 transformer；例如 N=12、N₁=8 表示 8 步模型生成和 4 步复制。
+页面同时预览左右 X/Y、过程视频及冻结检查表，保存阶段一 X、最终 Y 和参数记录。
+默认精确复制终点；epsilon>0 可提前停止。互补任务 `(C,Q)` 需要条件模型及训练权重，页面明确其实现范围。
+完整参数、公式和训练目标构造见 [双噪声实验说明](readme_dual_noise.md)。
 
 ```bash
-python scripts/dual_noise_inference.py --prompt "Mona Lisa" --mode initial --seed-a 42 --seed-b 43 --weight-b 0.5 --save-steps
-python scripts/dual_noise_inference.py --prompt "Mona Lisa" --mode latent --mix-step 4 --save-steps
-python scripts/dual_noise_inference.py --prompt "Mona Lisa" --mode velocity --velocity-rule coupled --save-steps
-# velocity 可改为 independent；initial 可添加 --raw-initial-mix；可添加 --analyze-velocity 导出有效更新统计
+python scripts/dual_noise_inference.py --prompt "Mona Lisa" --steps 12 --stage1-steps 8 --save-steps
+python scripts/dual_noise_inference.py --prompt "Mona Lisa" --steps 12 --stage1-steps 8 --terminal-epsilon 0.01 --analyze-velocity
 ```
 
 历史文生图、参考图、Qwen 重绘和 OmniBench 结果归档在 `tmp/history/`；

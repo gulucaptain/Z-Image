@@ -71,7 +71,7 @@ class DualNoiseTests(unittest.TestCase):
 
     def test_initial_mix_and_variance_compensation(self):
         for normalized in (False, True):
-            config = DualNoiseConfig(weight_b=0.3, normalize_initial=normalized)
+            config = DualNoiseConfig("initial", weight_b=0.3, normalize_initial=normalized)
             expected = 0.7 * noise(42) + 0.3 * noise(43)
             if normalized:
                 expected /= math.sqrt(0.7**2 + 0.3**2)
@@ -82,7 +82,7 @@ class DualNoiseTests(unittest.TestCase):
             self.assertEqual(calls, 4)
         generator = torch.Generator().manual_seed(7)
         a, b = [torch.randn((100000,), generator=generator) for _ in range(2)]
-        mixed = DualNoiseState(DualNoiseConfig(), a, b).initial
+        mixed = DualNoiseState(DualNoiseConfig("initial"), a, b).initial
         self.assertAlmostEqual(mixed.var().item(), 1, delta=0.02)
 
     def test_latent_mix_occurs_after_k_updates_then_single_trajectory(self):
@@ -140,28 +140,16 @@ class DualNoiseTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 config.validate(4)
 
-    def test_gradio_stream_artifacts_and_experiment_metadata(self):
-        plot_data([])
+    def test_legacy_experiment_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             settings = replace(Settings(), output_dir=root / "outputs", step_dir=root / "steps")
             service = GenerationService(settings)
             service.components, service.device = components(), "cpu"
-            app = build_app(settings, service)
-            binding = next(f for f in app.fns.values() if f.fn and f.fn.__name__ == "dual")
-            updates = list(binding.fn("scene", "", "latent", 43, 0.5, 2, True, "coupled", 16, 16, 4, 0, 42, True))
-            for update in updates:
-                self.assertEqual(len(update), len(binding.outputs))
-                for component, value in zip(binding.outputs, update):
-                    component.postprocess(value)
-            self.assertTrue(updates[-1][2].endswith("steps.mp4"))
-            self.assertEqual([len(update[1]) for update in updates], [0, 1, 2, 3, 4, 4])
-            metadata_file = next(p for p in updates[-1][3] if p.endswith("metadata.json"))
-            data = json.loads(Path(metadata_file).read_text())
-            self.assertEqual(data["kind"], "dual_noise")
-            self.assertEqual(data["seed"], 42)
-            self.assertEqual(data["dual_noise"]["seed_b"], 43)
-            self.assertEqual(len(data["dual_noise_trace"]), 4)
+            result = service.generate(GenerationRequest("scene", height=16, width=16, steps=4),
+                                      kind="dual_noise", dual_noise=DualNoiseConfig("latent", mix_step=2))
+            data = json.loads(Path(result["metadata"]).read_text())
+            self.assertEqual(data["dual_noise"]["mode"], "latent")
             self.assertTrue(data["dual_noise_trace"][1]["merged_now"])
 
 

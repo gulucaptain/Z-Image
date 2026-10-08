@@ -86,9 +86,23 @@ def generate(
     callback_on_velocity: Optional[Callable[[dict], None]] = None,
     dual_noise=None,
     callback_on_dual_step: Optional[Callable[[dict], None]] = None,
+    callback_on_dual_state: Optional[Callable] = None,
 ):
     if dual_noise is not None:
         dual_noise.validate(num_inference_steps)
+        if dual_noise.mode == "staged_copy":
+            from .staged_flow import generate_staged
+            return generate_staged(
+                generate, dual_noise, transformer=transformer, vae=vae,
+                text_encoder=text_encoder, tokenizer=tokenizer, scheduler=scheduler,
+                prompt=prompt, height=height, width=width, num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale, negative_prompt=negative_prompt,
+                num_images_per_prompt=num_images_per_prompt, generator=generator,
+                cfg_normalization=cfg_normalization, cfg_truncation=cfg_truncation,
+                max_sequence_length=max_sequence_length, output_type=output_type,
+                callback_on_step_end=callback_on_step_end, callback_on_velocity=callback_on_velocity,
+                callback_on_dual_step=callback_on_dual_step, callback_on_dual_state=callback_on_dual_state,
+            )
     device = next(transformer.parameters()).device
 
     if hasattr(vae, "config") and hasattr(vae.config, "block_out_channels"):

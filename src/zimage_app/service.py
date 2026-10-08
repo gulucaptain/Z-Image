@@ -156,7 +156,15 @@ class GenerationService:
             if dual_noise is not None:
                 metadata["dual_noise"] = asdict(dual_noise)
                 metadata["dual_noise_trace"] = []
-                metadata["velocity_convention"] = "dz/dsigma; latent merge step includes jump/delta_sigma"
+                if dual_noise.mode == "staged_copy":
+                    first, second = dual_noise.stage_steps(request.steps)
+                    metadata.update(stage1_steps=first, stage2_steps=second,
+                                    experiment="pretrained_generation_then_analytic_copy",
+                                    preview_layout="left X, right Y; active branch switches at stage boundary",
+                                    velocity_convention="diagnostics: local dz/dsigma; trace: joint dz/dt",
+                                    output_component="Y", joint_model_trained=False)
+                else:
+                    metadata["velocity_convention"] = "dz/dsigma; latent merge step includes jump/delta_sigma"
             metadata_path = run_dir / "metadata.json"
             def persist():
                 temporary = metadata_path.with_suffix(".tmp")
@@ -171,23 +179,57 @@ class GenerationService:
                 if request.save_steps:
                     step_dir.mkdir(parents=True, exist_ok=True)
 
+                joint_preview = None
+
+                def on_dual_state(index, x, y, trace):
+                    nonlocal joint_preview
+                    if not request.save_steps and index + 1 not in {metadata["stage1_steps"], request.steps}:
+                        return
+                    from PIL import Image, ImageDraw
+                    left = decode_image(self.components["vae"], x)
+                    right = decode_image(self.components["vae"], y)
+                    joint_preview = Image.new("RGB", (left.width + right.width, max(left.height, right.height) + 32), "white")
+                    joint_preview.paste(left, (0, 0))
+                    joint_preview.paste(right, (left.width, 0))
+                    ImageDraw.Draw(joint_preview).text(
+                        (8, joint_preview.height - 24),
+                        f"Stage {trace['stage']} | left: X ({'active' if trace['stage'] == 1 else 'frozen'}) | right: Y ({'frozen' if trace['stage'] == 1 else 'active'})",
+                        fill="black",
+                    )
+                    if trace["stage"] == 1 and index + 1 == metadata["stage1_steps"]:
+                        left.save(run_dir / "stage1_X.png")
+                        metadata["stage1_image"] = str(run_dir / "stage1_X.png")
+                    if index + 1 == request.steps:
+                        joint_preview.save(run_dir / "final_XY.png")
+                        metadata["joint_final_image"] = str(run_dir / "final_XY.png")
+
                 def on_step(index, timestep, latents):
                     if request.save_steps:
                         path = step_dir / f"step_{index + 1:03d}.png"
-                        decode_image(self.components["vae"], latents).save(path)
+                        if joint_preview is not None:
+                            joint_preview.save(path)
+                        else:
+                            decode_image(self.components["vae"], latents).save(path)
                         paths.append(str(path))
                     if progress:
-                        progress(min((index + 1) / request.steps, 1), desc=f"采样 step {index + 1}/{request.steps}")
+                        stage = metadata.get("dual_noise_trace", [])
+                        phase = f"阶段 {stage[-1]['stage']} · 更新 {stage[-1]['active']} · " if stage and "stage" in stage[-1] else ""
+                        progress(min((index + 1) / request.steps, 1), desc=f"{phase}采样 step {index + 1}/{request.steps}")
                     if step_callback:
                         step_callback({"image": paths[-1] if paths else None,
                                        "steps": list(paths), "metadata": str(metadata_path),
                                        "diagnostics": diagnostics.snapshot() if diagnostics else None,
+                                       "stage1_image": metadata.get("stage1_image"),
+                                       "joint_final_image": metadata.get("joint_final_image"),
+                                       "dual_noise_trace": list(metadata.get("dual_noise_trace", [])),
                                        "status": f"采样 step {index + 1}/{request.steps}"})
 
                 with torch.inference_mode():
                     analysis_kwargs = {"callback_on_velocity": diagnostics.record} if diagnostics else {}
                     if dual_noise is not None:
                         analysis_kwargs.update(dual_noise=dual_noise, callback_on_dual_step=metadata["dual_noise_trace"].append)
+                        if dual_noise.mode == "staged_copy":
+                            analysis_kwargs["callback_on_dual_state"] = on_dual_state
                     images = generate(**self.components, prompt=request.prompt,
                                       height=request.height, width=request.width,
                                       num_inference_steps=request.steps, guidance_scale=request.guidance_scale,
@@ -217,6 +259,9 @@ class GenerationService:
                     metadata["velocity_analysis"] = diagnostics.snapshot()
                 persist()
                 return {"image": str(final), "steps": paths, "metadata": str(metadata_path),
+                        "stage1_image": metadata.get("stage1_image"),
+                        "joint_final_image": metadata.get("joint_final_image"),
+                        "dual_noise_trace": list(metadata.get("dual_noise_trace", [])),
                         "step_video": step_video,
                         "diagnostics": diagnostics.snapshot() if diagnostics else None,
                         "status": f"完成 | {request.width}×{request.height} | seed={request.seed} | {metadata['elapsed_seconds']:.2f} 秒\n{final}"
